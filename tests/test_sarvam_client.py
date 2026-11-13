@@ -4,6 +4,10 @@ import json
 from backend.privacy import sarvam_client
 
 
+# --------------------------------------------------
+# 1. Missing API key fallback
+# --------------------------------------------------
+
 def test_missing_key_uses_local_fallback(monkeypatch):
 
     monkeypatch.setenv(
@@ -20,6 +24,10 @@ def test_missing_key_uses_local_fallback(monkeypatch):
     assert result["reason"] == "api_key_not_configured"
 
 
+# --------------------------------------------------
+# 2. Empty input fallback
+# --------------------------------------------------
+
 def test_empty_input_uses_fallback():
 
     result = sarvam_client.analyze_sanitized_context("")
@@ -27,6 +35,10 @@ def test_empty_input_uses_fallback():
     assert result["status"] == "fallback"
     assert result["reason"] == "empty_input"
 
+
+# --------------------------------------------------
+# 3. Never send unmasked email to Sarvam
+# --------------------------------------------------
 
 def test_unmasked_email_is_never_sent(monkeypatch):
 
@@ -48,6 +60,10 @@ def test_unmasked_email_is_never_sent(monkeypatch):
     assert result["status"] == "fallback"
     assert result["reason"] == "possible_unmasked_sensitive_data"
 
+
+# --------------------------------------------------
+# 4. Successful Sarvam response and usage tracking
+# --------------------------------------------------
 
 def test_sarvam_success_and_usage_tracking(monkeypatch):
 
@@ -83,9 +99,7 @@ def test_sarvam_success_and_usage_tracking(monkeypatch):
     def fake_post(url, headers, json, timeout):
 
         assert url == sarvam_client.SARVAM_URL
-
         assert json["messages"][1]["content"] == sanitized_text
-
         assert headers["api-subscription-key"] == "fake-test-key"
 
         return FakeResponse()
@@ -95,8 +109,6 @@ def test_sarvam_success_and_usage_tracking(monkeypatch):
         "post",
         fake_post
     )
-
-    tracker = sarvam_client.UsageTracker()
 
     before = sarvam_client.usage_tracker.get_stats()
 
@@ -108,7 +120,30 @@ def test_sarvam_success_and_usage_tracking(monkeypatch):
 
     assert result["status"] == "success"
     assert result["provider"] == "sarvam"
-
     assert result["usage"]["total_tokens"] == 35
-
     assert after["total_tokens"] - before["total_tokens"] == 35
+
+
+# --------------------------------------------------
+# 5. Sarvam connection failure fallback
+# --------------------------------------------------
+
+def test_sarvam_connection_failure_uses_fallback(monkeypatch):
+
+    monkeypatch.setenv("SARVAM_API_KEY", "fake-test-key")
+
+    def fake_post(*args, **kwargs):
+        raise sarvam_client.httpx.ConnectError("Connection failed")
+
+    monkeypatch.setattr(
+        sarvam_client.httpx,
+        "post",
+        fake_post
+    )
+
+    result = sarvam_client.analyze_sanitized_context(
+        "This document explains office procedures."
+    )
+
+    assert result["status"] == "fallback"
+    assert result["provider"] == "local"

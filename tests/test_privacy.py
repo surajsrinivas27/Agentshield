@@ -15,6 +15,10 @@ def find_entity(text, entity_type):
     return matching[0]
 
 
+# --------------------------------------------------
+# 1. Basic sensitive information detection
+# --------------------------------------------------
+
 def test_person_detection():
     text = "Employee Rahul"
 
@@ -63,6 +67,10 @@ def test_token_detection():
     assert text[entity["start"]:entity["end"]] == "abcdefghijklmnop"
 
 
+# --------------------------------------------------
+# 2. Entity position and confidence validation
+# --------------------------------------------------
+
 def test_entity_positions_are_valid():
     text = "Employee Rahul, email rahul@example.com"
 
@@ -73,3 +81,36 @@ def test_entity_positions_are_valid():
         assert entity["end"] > entity["start"]
         assert entity["end"] <= len(text)
         assert 0 <= entity["confidence"] <= 1
+
+
+# --------------------------------------------------
+# 3. Configurable custom-rule detection
+# --------------------------------------------------
+
+def test_custom_rule_detection():
+    text = "Our confidential Project Falcon is launching soon"
+
+    entity = find_entity(text, "OTHER_CONFIGURED")
+
+    assert text[entity["start"]:entity["end"]] == "Project Falcon"
+    assert entity["confidence"] == 0.95
+
+
+def test_custom_rule_case_insensitive():
+    text = "Our confidential project falcon is launching soon"
+
+    entity = find_entity(text, "OTHER_CONFIGURED")
+
+    assert text[entity["start"]:entity["end"]] == "project falcon"
+
+
+# --------------------------------------------------
+# 4. Unicode offset validation
+# --------------------------------------------------
+
+def test_unicode_offsets_are_correct():
+    text = "नमस्ते Rahul, email rahul@example.com"
+
+    entity = find_entity(text, "EMAIL")
+
+    assert text[entity["start"]:entity["end"]] == "rahul@example.com"
