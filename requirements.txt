@@ -1,9 +1,13 @@
+
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.10.0
 python-dotenv>=1.0.0
 httpx>=0.28.0
 pytest>=8.0.0
+
+# Privacy engine (Person 2)
+presidio-analyzer
 
 # Database infrastructure (SQLAlchemy 2.x)
 SQLAlchemy>=2.0.30
