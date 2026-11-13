@@ -1,5 +1,7 @@
 
+import json
 import re
+from pathlib import Path
 
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
@@ -143,14 +145,71 @@ def is_valid_card(number):
 
 
 # --------------------------------------------------
-# 4. Main sensitive information detection function
+# 4. Load configurable custom sensitive-data rules
+# --------------------------------------------------
+
+def load_custom_rules():
+
+    config_path = Path(__file__).with_name("custom_rules.json")
+
+    with open(config_path, "r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError("Custom rules configuration must be an object")
+
+    rules = config.get("rules", [])
+
+    if not isinstance(rules, list):
+        raise ValueError("Custom rules must be a list")
+
+    compiled_rules = []
+
+    for rule in rules:
+
+        if not isinstance(rule, dict):
+            raise ValueError("Each custom rule must be an object")
+
+        value = rule.get("value")
+        entity_type = rule.get("type")
+        confidence = rule.get("confidence")
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Custom rule value must be a non-empty string")
+
+        if entity_type != "OTHER_CONFIGURED":
+            raise ValueError("Custom rule type must be OTHER_CONFIGURED")
+
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+        ):
+            raise ValueError("Custom rule confidence must be between 0 and 1")
+
+        compiled_rules.append(
+            (
+                re.compile(re.escape(value), re.IGNORECASE),
+                entity_type,
+                float(confidence)
+            )
+        )
+
+    return compiled_rules
+
+
+# --------------------------------------------------
+# 5. Main sensitive information detection function
 # --------------------------------------------------
 
 def detect_sensitive_data(text):
 
+    if not isinstance(text, str):
+        raise TypeError("Input text must be a string")
+
     detected = {}
 
-    # STEP A: Regex detection
+    # STEP A: Existing Regex detection
     for pattern, entity_type, group, confidence in REGEX_RULES:
 
         for match in pattern.finditer(text):
@@ -172,7 +231,25 @@ def detect_sensitive_data(text):
                 "confidence": confidence
             }
 
-    # STEP B: Microsoft Presidio detection
+    # STEP B: Configurable custom-rule detection
+    for pattern, entity_type, confidence in load_custom_rules():
+
+        for match in pattern.finditer(text):
+
+            start, end = match.span()
+
+            key = (start, end)
+
+            if key not in detected:
+
+                detected[key] = {
+                    "start": start,
+                    "end": end,
+                    "type": entity_type,
+                    "confidence": confidence
+                }
+
+    # STEP C: Microsoft Presidio detection
     results = analyzer.analyze(
         text=text,
         language="en",
@@ -202,8 +279,8 @@ def detect_sensitive_data(text):
 
         key = (result.start, result.end)
 
-        # Keep existing Regex result if the exact span
-        # has already been detected.
+        # Keep existing Regex or custom-rule result
+        # if the exact span has already been detected.
         if key not in detected:
 
             detected[key] = {
@@ -213,7 +290,7 @@ def detect_sensitive_data(text):
                 "confidence": round(float(result.score), 2)
             }
 
-    # STEP C: Sort results by their positions
+    # STEP D: Sort results by their positions
     entities = sorted(
         detected.values(),
         key=lambda item: (item["start"], item["end"])
