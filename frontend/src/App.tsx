@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { AnimatePresence, MotionConfig, motion } from 'motion/react'
 import {
   analyzePrivacy,
@@ -14,6 +14,7 @@ import {
   AgentActivityPage,
   AuthorizationPage,
   PrivacyGuardPage,
+  type PrivacyComparison,
   type PrivacySnapshot,
   type WorkflowSnapshot,
 } from './security-pages'
@@ -30,45 +31,94 @@ const navItems = [
   { label: 'Audit Logs', icon: '▤' },
 ]
 
-const activity = [
-  {
-    icon: '✉',
-    title: 'Email content scanned',
-    detail: 'Sample activity · demo data',
-    tag: 'SAMPLE',
-    color: 'green',
-  },
-  {
-    icon: '⌁',
-    title: 'Agent requested CRM lookup',
-    detail: 'Sample activity · demo data',
-    tag: 'SAMPLE',
-    color: 'amber',
-  },
-  {
-    icon: '⛨',
-    title: 'External instruction blocked',
-    detail: 'Sample activity · demo data',
-    tag: 'SAMPLE',
-    color: 'red',
-  },
-]
+type DashboardActivity = {
+  id: string
+  icon: string
+  title: string
+  detail: string
+  tag: string
+  color: 'green' | 'amber' | 'red'
+}
+
+type PipelinePhase = 'idle' | 'privacy' | 'privacy-complete' | 'agent' | 'authorization' | 'complete' | 'error'
+
+function DataFlowVisualizer({
+  phase,
+  privacyComplete,
+  workflowComplete,
+}: {
+  phase: PipelinePhase
+  privacyComplete: boolean
+  workflowComplete: boolean
+}) {
+  const privacyDone = privacyComplete || ['privacy-complete', 'agent', 'authorization', 'complete'].includes(phase)
+  const agentDone = workflowComplete || ['authorization', 'complete'].includes(phase)
+  const authorizationDone = phase === 'complete' || (phase === 'idle' && workflowComplete)
+  const errorStep = phase === 'error' ? (privacyComplete ? 'agent' : 'privacy') : null
+  const statuses = [
+    privacyDone ? 'complete' : phase === 'privacy' ? 'active' : errorStep === 'privacy' ? 'error' : 'waiting',
+    agentDone ? 'complete' : phase === 'agent' ? 'active' : errorStep === 'agent' ? 'error' : 'waiting',
+    authorizationDone ? 'complete' : phase === 'authorization' ? 'active' : 'waiting',
+  ] as const
+  const titles = ['Privacy Guard', 'Agent Activity', 'Authorization Gateway']
+  const details = [
+    privacyDone ? 'Sensitive spans masked locally' : 'Detect and mask sensitive data',
+    agentDone ? 'Workflow and provenance received' : 'Process sanitized content',
+    authorizationDone ? 'Backend decision received' : 'Evaluate proposed actions',
+  ]
+  const symbols = ['⬡', '⌁', '⛨']
+  const connectorClasses = [privacyDone ? 'complete' : phase === 'privacy' ? 'active' : '', agentDone ? 'complete' : phase === 'agent' || phase === 'authorization' ? 'active' : '']
+
+  return (
+    <section className="data-flow-panel" aria-label="Secure task data flow">
+      <div className="data-flow-heading">
+        <div>
+          <span className="eyebrow">SECURE DATA FLOW</span>
+          <h2>Every step stays visible.</h2>
+        </div>
+        <span className={`flow-state ${phase === 'error' ? 'error' : ''}`} role="status">
+          {phase === 'privacy' ? 'SCANNING' : phase === 'agent' ? 'AGENT RUNNING' : phase === 'authorization' ? 'CHECKING POLICY' : phase === 'error' ? 'NEEDS ATTENTION' : phase === 'complete' ? 'COMPLETE' : privacyDone ? 'READY FOR AGENT' : 'AWAITING REQUEST'}
+        </span>
+      </div>
+      <div className="data-flow-track">
+        {titles.map((title, index) => (
+          <div className={`flow-step ${statuses[index]}`} key={title}>
+            <span className="flow-step-icon" aria-hidden="true">{symbols[index]}</span>
+            <span className="flow-step-copy">
+              <strong>{title}</strong>
+              <small>{details[index]}</small>
+            </span>
+            <span className="flow-step-indicator" aria-hidden="true">
+              {statuses[index] === 'complete' ? '✓' : statuses[index] === 'active' ? '…' : statuses[index] === 'error' ? '!' : String(index + 1).padStart(2, '0')}
+            </span>
+            {index < 2 && (
+              <span className={`flow-connector ${connectorClasses[index]}`} aria-hidden="true">
+                <i />
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
 
 function AssistantForm({
   onPrivacyComplete,
   onWorkflowComplete,
   onApprovalSubmitted,
 }: {
-  onPrivacyComplete: (snapshot: PrivacySnapshot) => void
+  onPrivacyComplete: (snapshot: PrivacySnapshot, comparison: PrivacyComparison) => void
   onWorkflowComplete: (snapshot: WorkflowSnapshot) => void
   onApprovalSubmitted: (actionId: string, decision: 'approve' | 'reject') => void
 }) {
   const [task, setTask] = useState('')
   const [sourceType, setSourceType] = useState<'email' | 'document'>('email')
-  const [sourceId, setSourceId] = useState('EMAIL_001')
+  const [sourceId, setSourceId] = useState('')
   const [content, setContent] = useState('')
   const [loading, setLoading] = useState(false)
   const [workflowLoading, setWorkflowLoading] = useState(false)
+  const [flowPhase, setFlowPhase] = useState<PipelinePhase>('idle')
   const [error, setError] = useState('')
   const [workflowError, setWorkflowError] = useState('')
   const [entities, setEntities] = useState<PrivacyEntity[]>([])
@@ -101,6 +151,7 @@ function AssistantForm({
       return
     }
 
+    setFlowPhase('privacy')
     setLoading(true)
     const newTaskId = `TASK_${Date.now()}`
 
@@ -130,9 +181,15 @@ function AssistantForm({
         sourceId,
         sourceType,
         checkedAt: new Date().toISOString(),
+      }, {
+        originalText: content,
+        maskedText: masking.maskedText,
+        entities: result.entities,
       })
       setHasAnalyzed(true)
+      setFlowPhase('privacy-complete')
     } catch (requestError) {
+      setFlowPhase('error')
       setError(
         requestError instanceof Error
           ? requestError.message
@@ -146,6 +203,7 @@ function AssistantForm({
   async function handleRunWorkflow() {
     setWorkflowError('')
     setWorkflowLoading(true)
+    setFlowPhase('agent')
 
     try {
       const result = await runWorkflow({
@@ -160,7 +218,11 @@ function AssistantForm({
 
       setWorkflowResult(result)
       onWorkflowComplete({ result, taskId, sourceId, sourceType })
+      setFlowPhase('authorization')
+      await new Promise((resolve) => window.setTimeout(resolve, 500))
+      setFlowPhase('complete')
     } catch (requestError) {
+      setFlowPhase('error')
       setWorkflowError(
         requestError instanceof Error
           ? requestError.message
@@ -207,6 +269,12 @@ function AssistantForm({
         Add your request and simulated email or document content.
       </p>
 
+      <DataFlowVisualizer
+        phase={flowPhase}
+        privacyComplete={hasAnalyzed}
+        workflowComplete={Boolean(workflowResult)}
+      />
+
       <form className="assistant-card" onSubmit={handlePrivacyCheck}>
         <label htmlFor="user-task">What should the AI assistant do?</label>
         <input
@@ -237,7 +305,7 @@ function AssistantForm({
               id="source-id"
               value={sourceId}
               onChange={(event) => setSourceId(event.target.value)}
-              placeholder="EMAIL_001"
+              placeholder="e.g. EMAIL_001"
             />
           </div>
         </div>
@@ -248,7 +316,7 @@ function AssistantForm({
           rows={8}
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          placeholder="Paste synthetic sample content here. Don’t use real personal data."
+          placeholder="Paste test email or document text here. Avoid real personal data."
         />
 
         <button className="primary-button" type="submit" disabled={loading}>
@@ -502,15 +570,17 @@ function Metric({
   trend,
   icon,
   color,
-  chart,
+  history,
 }: {
   title: string
   value: string
   trend: string
   icon: string
   color: string
-  chart: string
+  history: number[]
 }) {
+  const maxCount = Math.max(...history, 1)
+
   return (
     <article className="metric-card">
       <div className="metric-head">
@@ -519,31 +589,244 @@ function Metric({
       </div>
       <div className="metric-value">{value}</div>
       <div className="metric-foot">
-        <span className={trend.startsWith('↗') ? 'trend' : 'attention'}>
-          {trend}
-        </span>
-        <span>demo data</span>
+        <span>{trend}</span>
       </div>
-      <div className={`sparkline ${chart}`}>
-        {Array.from({ length: 12 }, (_, index) => (
-          <i key={index} />
+      <div
+        className={`sparkline ${color}`}
+        role="img"
+        aria-label={`${title} counts over recent updates: ${history.join(', ')}`}
+      >
+        {history.map((count, index) => (
+          <i
+            key={`${index}-${count}`}
+            style={{ height: `${Math.max(3, Math.round((count / maxCount) * 28))}px` }}
+          />
         ))}
       </div>
     </article>
   )
 }
 
-function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
+function SessionTrendChart({ history }: { history: number[][] }) {
+  const chartSeries = [
+    { label: 'Requests protected', values: history[0] ?? [0], color: '#ad96ff' },
+    { label: 'Sensitive items masked', values: history[1] ?? [0], color: '#70dcb6' },
+    { label: 'Actions blocked', values: history[2] ?? [0], color: '#ff9991' },
+    { label: 'Awaiting approval', values: history[3] ?? [0], color: '#f4c66d' },
+  ]
+  const maxCount = Math.max(1, ...chartSeries.flatMap((series) => series.values))
+  const hasActivity = chartSeries.some((series) => series.values.some((count) => count > 0))
+  const chartWidth = 680
+  const chartHeight = 190
+  const left = 34
+  const right = 668
+  const top = 18
+  const bottom = 156
+  const coordinates = (values: number[]) => values.map((count, index) => {
+    const x = values.length === 1
+      ? right
+      : left + ((right - left) * index) / (values.length - 1)
+    const y = bottom - (count / maxCount) * (bottom - top)
+    return `${x},${y}`
+  }).join(' ')
+
+  return (
+    <section className="panel trend-panel" data-scroll-reveal aria-labelledby="session-trend-title">
+      <div className="panel-heading">
+        <div>
+          <h3 id="session-trend-title">Session trend</h3>
+          <p>Live counts across recent updates in this session.</p>
+        </div>
+        {hasActivity && <span className="trend-live"><i /> LIVE SESSION</span>}
+      </div>
+
+      {hasActivity ? (
+        <>
+          <svg
+            className="session-chart"
+            viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+            role="img"
+            aria-label={chartSeries.map((series) => `${series.label}: ${series.values.join(', ')}`).join('. ')}
+          >
+            <text className="chart-axis-label" x="4" y={top + 4}>{maxCount}</text>
+            <text className="chart-axis-label" x="18" y={bottom + 4}>0</text>
+            {[top, (top + bottom) / 2, bottom].map((y) => (
+              <line key={y} className="chart-gridline" x1={left} x2={right} y1={y} y2={y} />
+            ))}
+            {chartSeries.map((series) => (
+              <g key={series.label}>
+                {series.values.length > 1 && (
+                  <polyline
+                    points={coordinates(series.values)}
+                    fill="none"
+                    stroke={series.color}
+                    strokeWidth="2.5"
+                    strokeLinejoin="round"
+                    strokeLinecap="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
+                <circle
+                  cx={series.values.length === 1 ? right : right}
+                  cy={bottom - ((series.values.at(-1) ?? 0) / maxCount) * (bottom - top)}
+                  r="4"
+                  fill={series.color}
+                  className="chart-current-point"
+                />
+              </g>
+            ))}
+          </svg>
+          <div className="chart-legend">
+            {chartSeries.map((series) => (
+              <span key={series.label}>
+                <i style={{ backgroundColor: series.color }} />{series.label}
+              </span>
+            ))}
+          </div>
+        </>
+      ) : (
+        <p className="chart-empty">Complete a secure request to build your session graph.</p>
+      )}
+    </section>
+  )
+}
+
+function Dashboard({
+  onNavigate,
+  playIntro,
+  onIntroComplete,
+  stats,
+  recentActivity,
+  privacySnapshot,
+  workflowSnapshot,
+  metricHistory,
+}: {
+  onNavigate: (page: string) => void
+  playIntro: boolean
+  onIntroComplete: () => void
+  stats: {
+    protectedRequests: number
+    maskedItems: number
+    blockedActions: number
+    pendingApprovals: number
+  }
+  recentActivity: DashboardActivity[]
+  privacySnapshot: PrivacySnapshot | null
+  workflowSnapshot: WorkflowSnapshot | null
+  metricHistory: number[][]
+}) {
+  const orbRef = useRef<HTMLDivElement>(null)
+  const orbVisualRef = useRef<HTMLDivElement>(null)
+  const workflowActions = workflowSnapshot?.result.actions ?? []
+  const postureLabel = stats.pendingApprovals > 0
+    ? 'REVIEW NEEDED'
+    : workflowSnapshot
+      ? workflowActions.some((action) => action.decision === 'BLOCK')
+        ? 'POLICY ENFORCED'
+        : 'WORKFLOW CHECKED'
+      : privacySnapshot
+        ? 'PRIVACY CHECKED'
+        : 'AWAITING REQUEST'
+  useLayoutEffect(() => {
+    const slot = orbRef.current
+    const orb = orbVisualRef.current
+    if (!slot || !orb) return
+
+    if (!playIntro) {
+      orb.style.visibility = 'visible'
+      return
+    }
+
+    const bounds = slot.getBoundingClientRect()
+    const centerX = bounds.left + bounds.width / 2
+    const centerY = bounds.top + bounds.height / 2
+    orb.style.setProperty('--intro-x', `${window.innerWidth / 2 - centerX}px`)
+    orb.style.setProperty('--intro-y', `${window.innerHeight / 2 - centerY}px`)
+    orb.classList.add('orb-animate')
+  }, [playIntro])
+
+  useEffect(() => {
+    const revealTargets = document.querySelectorAll<HTMLElement>('[data-scroll-reveal]')
+    if (!('IntersectionObserver' in window)) {
+      revealTargets.forEach((target) => target.classList.add('is-revealed'))
+      return
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('is-revealed')
+          observer.unobserve(entry.target)
+        }
+      })
+    }, { threshold: 0.12, rootMargin: '0px 0px -28px 0px' })
+
+    revealTargets.forEach((target) => observer.observe(target))
+    return () => observer.disconnect()
+  }, [])
+
+  function handleHeroPointerMove(event: ReactPointerEvent<HTMLElement>) {
+    if (event.pointerType === 'touch') return
+    const bounds = event.currentTarget.getBoundingClientRect()
+    const x = (event.clientX - bounds.left - bounds.width / 2) / bounds.width
+    const y = (event.clientY - bounds.top - bounds.height / 2) / bounds.height
+    const layers: Record<string, number> = {
+      '--hero-glow-x': x * 56,
+      '--hero-glow-y': y * 36,
+      '--aura-x': x * -24,
+      '--aura-y': y * -16,
+      '--grid-x': x * -32,
+      '--grid-y': y * -24,
+      '--copy-x': x * -20,
+      '--copy-y': y * -12,
+      '--spline-x': x * 56,
+      '--spline-y': y * 42,
+      '--orb-far-x': x * 22,
+      '--orb-far-y': y * 20,
+      '--orbit-one-x': x * 54,
+      '--orbit-one-y': y * 40,
+      '--orbit-two-x': x * -72,
+      '--orbit-two-y': y * -54,
+      '--shield-x': x * 44,
+      '--shield-y': y * 40,
+      '--dot-one-x': x * 68,
+      '--dot-one-y': y * 48,
+      '--dot-two-x': x * -58,
+      '--dot-two-y': y * -44,
+      '--dot-three-x': x * 48,
+      '--dot-three-y': y * -40,
+    }
+
+    Object.entries(layers).forEach(([property, value]) => {
+      event.currentTarget.style.setProperty(property, `${value.toFixed(1)}px`)
+    })
+  }
+
+  function resetHeroParallax(event: ReactPointerEvent<HTMLElement>) {
+    const properties = [
+      '--hero-glow-x', '--hero-glow-y', '--aura-x', '--aura-y', '--grid-x', '--grid-y',
+      '--copy-x', '--copy-y',
+      '--spline-x', '--spline-y',
+      '--orb-far-x', '--orb-far-y', '--orbit-one-x', '--orbit-one-y', '--orbit-two-x',
+      '--orbit-two-y', '--shield-x', '--shield-y', '--dot-one-x', '--dot-one-y',
+      '--dot-two-x', '--dot-two-y', '--dot-three-x', '--dot-three-y',
+    ]
+    properties.forEach((property) => event.currentTarget.style.removeProperty(property))
+  }
+
   return (
     <>
       <section className="welcome-row">
         <div>
-          <div className="eyebrow">THURSDAY, NOVEMBER 13, 2026</div>
+          <div className="eyebrow">
+            {new Date().toLocaleDateString(undefined, {
+              weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+            }).toUpperCase()}
+          </div>
           <h1>Your agents, under control.</h1>
           <p className="subtitle">
             Keep sensitive data safe and every agent action accountable.
           </p>
-          <span className="demo-data-tag">ILLUSTRATIVE DEMO DATA</span>
         </div>
         <button
           className="primary-button"
@@ -553,7 +836,11 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
         </button>
       </section>
 
-      <section className="hero-panel">
+      <section
+        className="hero-panel"
+        onPointerMove={handleHeroPointerMove}
+        onPointerLeave={resetHeroParallax}
+      >
         <div className="hero-copy">
           <div className="hero-kicker">
             <span className="sparkle">✦</span> YOUR SECURITY COMMAND CENTER
@@ -574,32 +861,38 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
             Start a secure request <span>↗</span>
           </button>
         </div>
-        <div className="orb-wrap" aria-hidden="true">
-          {splineEmbedUrl ? (
-            <iframe
-              className="spline-embed"
-              src={splineEmbedUrl}
-              title="Decorative AgentShield 3D shield"
-              loading="lazy"
-              tabIndex={-1}
-            />
-          ) : (
-            <>
-              <div className="orb-grid" />
-              <div className="orbit orbit-one" />
-              <div className="orbit orbit-two" />
-              <div className="shield-orb">
-                <span>✦</span>
-              </div>
-              <div className="orbit-dot dot-one" />
-              <div className="orbit-dot dot-two" />
-              <div className="orbit-dot dot-three" />
-            </>
-          )}
+        <div ref={orbRef} className="orb-slot" aria-hidden="true">
+          <div
+            ref={orbVisualRef}
+            className="orb-wrap"
+            onAnimationEnd={playIntro ? onIntroComplete : undefined}
+          >
+              {splineEmbedUrl ? (
+                <iframe
+                  className="spline-embed"
+                  src={splineEmbedUrl}
+                  title="Decorative AgentShield 3D shield"
+                  loading="lazy"
+                  tabIndex={-1}
+                />
+              ) : (
+                <>
+                  <div className="orb-grid" />
+                  <div className="orbit orbit-one" />
+                  <div className="orbit orbit-two" />
+                  <div className="shield-orb">
+                    <span>✦</span>
+                  </div>
+                  <div className="orbit-dot dot-one" />
+                  <div className="orbit-dot dot-two" />
+                  <div className="orbit-dot dot-three" />
+                </>
+              )}
+          </div>
         </div>
         <div className="hero-foot">
           <span>
-            <i /> PRIVACY LAYER ACTIVE
+            <i /> PRIVACY WORKFLOW
           </span>
           <span>
             LOCAL MASKING <b>·</b> POLICY CHECKS <b>·</b> AUDIT TRAIL
@@ -609,48 +902,50 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
 
       <section
         className="metrics-grid"
-        aria-label="Illustrative demo security summary"
+        aria-label="Security summary for this session"
       >
         <Metric
           title="Requests protected"
-          value="1,284"
-          trend="↗ 12.8%"
+          value={stats.protectedRequests.toLocaleString()}
+          trend="This session"
           icon="✳"
           color="violet"
-          chart="purple"
+          history={metricHistory[0]}
         />
         <Metric
           title="Sensitive items masked"
-          value="3,719"
-          trend="↗ 8.2%"
+          value={stats.maskedItems.toLocaleString()}
+          trend="Detected this session"
           icon="⬡"
           color="mint"
-          chart="green"
+          history={metricHistory[1]}
         />
         <Metric
           title="Actions blocked"
-          value="24"
-          trend="This week"
+          value={stats.blockedActions.toLocaleString()}
+          trend="By policy this session"
           icon="⛨"
           color="coral"
-          chart="red"
+          history={metricHistory[2]}
         />
         <Metric
           title="Awaiting approval"
-          value="02"
+          value={stats.pendingApprovals.toLocaleString()}
           trend="Needs your review"
           icon="◷"
           color="gold"
-          chart="gold"
+          history={metricHistory[3]}
         />
       </section>
 
-      <section className="lower-grid">
+      <SessionTrendChart history={metricHistory} />
+
+      <section className="lower-grid" data-scroll-reveal>
         <article className="panel activity-panel">
           <div className="panel-heading">
             <div>
               <h3>Recent activity</h3>
-              <p>Illustrative activity for the demo.</p>
+              <p>Events recorded during this session.</p>
             </div>
             <button
               className="text-button"
@@ -660,8 +955,14 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
             </button>
           </div>
           <div className="activity-list">
-            {activity.map((item) => (
-              <div className="activity-row" key={item.title}>
+            {recentActivity.length > 0 ? recentActivity.map((item) => (
+              <button
+                className="activity-row"
+                type="button"
+                key={item.id}
+                onClick={() => onNavigate('Agent Activity')}
+                aria-label={`View agent activity: ${item.title}`}
+              >
                 <div className={`activity-icon ${item.color}`}>{item.icon}</div>
                 <div className="activity-text">
                   <strong>{item.title}</strong>
@@ -669,8 +970,10 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
                 </div>
                 <span className={`status ${item.color}`}>{item.tag}</span>
                 <span className="row-arrow">›</span>
-              </div>
-            ))}
+              </button>
+            )) : (
+              <p className="empty-activity">No activity yet. Complete a privacy scan to see events here.</p>
+            )}
           </div>
         </article>
 
@@ -678,40 +981,35 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
           <div className="panel-heading">
             <div>
               <h3>Security posture</h3>
-              <p>Illustrative demo status.</p>
+              <p>Live results from this session.</p>
             </div>
-            <span className="posture-ok">● DEMO</span>
+            <span className={`posture-ok ${stats.pendingApprovals > 0 ? 'review' : ''}`}>● {postureLabel}</span>
           </div>
           <div className="posture-score">
-            <div className="score-ring">
-              <span>
-                98<small>/100</small>
-              </span>
+            <div className={`posture-mark ${workflowSnapshot || privacySnapshot ? 'checked' : ''}`} aria-hidden="true">
+              {stats.pendingApprovals > 0 ? '!' : workflowSnapshot || privacySnapshot ? '✓' : '·'}
             </div>
             <div>
-              <strong>Sample score</strong>
-              <p>
-                Replace this with measured
-                <br />
-                backend results.
-              </p>
+              <strong>{workflowSnapshot ? 'Workflow evaluated' : privacySnapshot ? 'Privacy scan completed' : 'No request checked yet'}</strong>
+              <p>{workflowSnapshot ? `${workflowActions.length} policy decision${workflowActions.length === 1 ? '' : 's'} received.` : 'Run a secure request to see protection status.'}</p>
             </div>
           </div>
           <div className="posture-items">
             <div>
-              <span className="checkmark">✓</span> Privacy protection
-              <strong>Sample</strong>
+              <span className={`checkmark ${privacySnapshot ? '' : 'inactive'}`}>{privacySnapshot ? '✓' : '·'}</span> Privacy scan
+              <strong>{privacySnapshot ? `${privacySnapshot.total} detected` : 'Not checked'}</strong>
             </div>
             <div>
-              <span className="checkmark">✓</span> Tool authorization
-              <strong>Sample</strong>
+              <span className={`checkmark ${workflowSnapshot ? '' : 'inactive'}`}>{workflowSnapshot ? '✓' : '·'}</span> Agent policy
+              <strong>{workflowSnapshot ? `${workflowActions.length} decision${workflowActions.length === 1 ? '' : 's'}` : 'Not checked'}</strong>
             </div>
             <div>
-              <span className="checkmark">✓</span> Audit logging
-              <strong>Sample</strong>
+              <span className={`checkmark ${stats.pendingApprovals ? 'pending' : workflowSnapshot ? '' : 'inactive'}`}>{stats.pendingApprovals ? '!' : workflowSnapshot ? '✓' : '·'}</span> Human review
+              <strong>{stats.pendingApprovals ? `${stats.pendingApprovals} awaiting` : workflowSnapshot ? 'No pending review' : 'Not checked'}</strong>
             </div>
           </div>
         </article>
+
       </section>
 
       <footer className="page-footer">
@@ -719,7 +1017,7 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
           AGENTSHIELD <b>·</b> KEEPING YOUR AI WORKFLOWS SAFE
         </span>
         <span>
-          DEMO DASHBOARD <i />
+          SESSION OVERVIEW
         </span>
       </footer>
     </>
@@ -728,21 +1026,90 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
 
 function App() {
   const [activePage, setActivePage] = useState('Overview')
+  const [introActive, setIntroActive] = useState(false)
+  const [brandSplashVisible, setBrandSplashVisible] = useState(true)
   const [privacySnapshot, setPrivacySnapshot] = useState<PrivacySnapshot | null>(null)
+  const [privacyComparison, setPrivacyComparison] = useState<PrivacyComparison | null>(null)
   const [workflowSnapshot, setWorkflowSnapshot] = useState<WorkflowSnapshot | null>(null)
+  const [dashboardStats, setDashboardStats] = useState({
+    protectedRequests: 0,
+    maskedItems: 0,
+    blockedActions: 0,
+  })
+  const [recentActivity, setRecentActivity] = useState<DashboardActivity[]>([])
+  const activitySequence = useRef(0)
+  const recordedWorkflowTasks = useRef(new Set<string>())
   const [approvalSubmissions, setApprovalSubmissions] = useState<
     Record<string, 'approve' | 'reject'>
   >({})
 
-  function handlePrivacyComplete(snapshot: PrivacySnapshot) {
+  useEffect(() => {
+    const splashTimer = window.setTimeout(() => {
+      setBrandSplashVisible(false)
+    }, 1800)
+
+    return () => window.clearTimeout(splashTimer)
+  }, [])
+
+  function addRecentActivity(entry: Omit<DashboardActivity, 'id'>) {
+    activitySequence.current += 1
+    const id = `activity-${activitySequence.current}`
+    setRecentActivity((current) => [{ ...entry, id }, ...current].slice(0, 5))
+  }
+
+  function handlePrivacyComplete(snapshot: PrivacySnapshot, comparison: PrivacyComparison) {
     setPrivacySnapshot(snapshot)
+    setPrivacyComparison(comparison)
     setWorkflowSnapshot(null)
     setApprovalSubmissions({})
+    setDashboardStats((current) => ({
+      ...current,
+      protectedRequests: current.protectedRequests + 1,
+      maskedItems: current.maskedItems + snapshot.total,
+    }))
+    addRecentActivity({
+      icon: '⬡',
+      title: 'Privacy scan completed',
+      detail: `${snapshot.total} sensitive item${snapshot.total === 1 ? '' : 's'} masked before processing`,
+      tag: 'SCANNED',
+      color: 'green',
+    })
   }
 
   function handleWorkflowComplete(snapshot: WorkflowSnapshot) {
     setWorkflowSnapshot(snapshot)
     setApprovalSubmissions({})
+    if (!recordedWorkflowTasks.current.has(snapshot.taskId)) {
+      recordedWorkflowTasks.current.add(snapshot.taskId)
+      const newlyBlocked = snapshot.result.actions.filter(
+        (action) => action.decision === 'BLOCK',
+      ).length
+      setDashboardStats((current) => ({
+        ...current,
+        blockedActions: current.blockedActions + newlyBlocked,
+      }))
+    }
+    if (snapshot.result.actions.length > 0) {
+      snapshot.result.actions.forEach((action) => {
+        const isBlocked = action.decision === 'BLOCK'
+        const needsReview = action.decision === 'APPROVE'
+        addRecentActivity({
+          icon: isBlocked ? '⛨' : needsReview ? '◷' : '✓',
+          title: isBlocked ? 'Agent action blocked' : needsReview ? 'Approval required' : 'Agent action allowed',
+          detail: `Policy decision for action ${action.action_id}`,
+          tag: action.decision,
+          color: isBlocked ? 'red' : needsReview ? 'amber' : 'green',
+        })
+      })
+    } else {
+      addRecentActivity({
+        icon: '⌁',
+        title: 'Agent workflow completed',
+        detail: `Task ${snapshot.taskId} completed without tool actions`,
+        tag: 'DONE',
+        color: 'green',
+      })
+    }
   }
 
   function handleApprovalSubmitted(
@@ -750,20 +1117,70 @@ function App() {
     decision: 'approve' | 'reject',
   ) {
     setApprovalSubmissions((current) => ({ ...current, [actionId]: decision }))
+    addRecentActivity({
+      icon: '✓',
+      title: `Approval ${decision === 'approve' ? 'granted' : 'rejected'}`,
+      detail: `Decision submitted for action ${actionId}`,
+      tag: decision === 'approve' ? 'APPROVED' : 'REJECTED',
+      color: decision === 'approve' ? 'green' : 'red',
+    })
   }
 
   const pendingApprovalCount = workflowSnapshot?.result.actions.filter(
     (action) => action.decision === 'APPROVE' && !approvalSubmissions[action.action_id],
   ).length ?? 0
+  const [metricHistory, setMetricHistory] = useState<number[][]>([
+    [0], [0], [0], [0],
+  ])
+
+  useEffect(() => {
+    const currentCounts = [
+      dashboardStats.protectedRequests,
+      dashboardStats.maskedItems,
+      dashboardStats.blockedActions,
+      pendingApprovalCount,
+    ]
+
+    setMetricHistory((currentHistory) => {
+      if (currentCounts.every((count, index) => currentHistory[index].at(-1) === count)) {
+        return currentHistory
+      }
+
+      return currentHistory.map((series, index) =>
+        [...series, currentCounts[index]].slice(-8),
+      )
+    })
+  }, [dashboardStats.protectedRequests, dashboardStats.maskedItems, dashboardStats.blockedActions, pendingApprovalCount])
 
   return (
     <MotionConfig reducedMotion="user">
-    <div className="dark app-shell">
+    <div className={`dark app-shell ${introActive ? 'intro-active' : ''}`}>
+      <div className="ambient-background" aria-hidden="true">
+        <span className="ambient-glow ambient-glow-one" />
+        <span className="ambient-glow ambient-glow-two" />
+        <span className="ambient-glow ambient-glow-three" />
+      </div>
+      {brandSplashVisible && (
+        <div className="brand-splash" aria-label="AgentShield AI Security Platform">
+          <div className="brand-splash-content">
+            <div className="brand-splash-planet" aria-hidden="true">
+              <span className="brand-planet-orbit orbit-back" />
+              <span className="brand-planet-orbit orbit-front" />
+              <span className="brand-planet-body" />
+            </div>
+            <h1>Agent<span>Shield</span></h1>
+            <p>AI SECURITY PLATFORM</p>
+          </div>
+        </div>
+      )}
       <aside className="sidebar">
         <a
           className="brand"
           href="#overview"
-          onClick={() => setActivePage('Overview')}
+          onClick={() => {
+            setIntroActive(false)
+            setActivePage('Overview')
+          }}
         >
           <span className="brand-mark">A</span>
           <span>
@@ -778,7 +1195,10 @@ function App() {
             <button
               key={item.label}
               className={`nav-item ${activePage === item.label ? 'active' : ''}`}
-              onClick={() => setActivePage(item.label)}
+              onClick={() => {
+                setIntroActive(false)
+                setActivePage(item.label)
+              }}
             >
               <span className="nav-icon">{item.icon}</span>
               {item.label}
@@ -791,20 +1211,18 @@ function App() {
 
         <div className="sidebar-bottom">
           <div className="secure-card">
-            <span className="secure-icon">✓</span>
+          <span className="secure-icon">◈</span>
             <div>
-              <strong>Protection active</strong>
-              <small>All systems operational</small>
+              <strong>AgentShield session</strong>
+              <small>{privacySnapshot ? 'Privacy scan completed' : 'Run a scan to begin'}</small>
             </div>
-            <span className="live-dot" />
           </div>
           <div className="profile">
-            <div className="avatar">CS</div>
+            <div className="avatar">AS</div>
             <div>
-              <strong>Chandana S</strong>
-              <small>Security admin</small>
+              <strong>Workspace user</strong>
+              <small>Current session</small>
             </div>
-            <span className="more">···</span>
           </div>
         </div>
       </aside>
@@ -816,12 +1234,19 @@ function App() {
           </div>
           <div className="top-actions">
             <span className="environment">
-              <i /> PROTECTION ON
+              <i /> LOCAL SESSION
             </span>
-            <button className="icon-button" aria-label="Notifications">
-              ♧<b />
+            <button
+              className="icon-button"
+              aria-label="Open audit logs"
+              onClick={() => {
+                setIntroActive(false)
+                setActivePage('Audit Logs')
+              }}
+            >
+              ▤
             </button>
-            <div className="top-avatar">CS</div>
+            <div className="top-avatar">AS</div>
           </div>
         </header>
 
@@ -843,11 +1268,13 @@ function App() {
               ) : activePage === 'Privacy Guard' ? (
                 <PrivacyGuardPage
                   snapshot={privacySnapshot}
+                  comparison={privacyComparison}
                   onNewRequest={() => setActivePage('AI Assistant')}
                 />
               ) : activePage === 'Agent Activity' ? (
                 <AgentActivityPage
                   snapshot={workflowSnapshot}
+                  comparison={privacyComparison}
                   onNewRequest={() => setActivePage('AI Assistant')}
                 />
               ) : activePage === 'Authorization' ? (
@@ -860,7 +1287,19 @@ function App() {
               ) : activePage === 'Audit Logs' ? (
                 <AuditLogs />
               ) : (
-                <Dashboard onNavigate={setActivePage} />
+                <Dashboard
+                  onNavigate={(page) => {
+                    setIntroActive(false)
+                    setActivePage(page)
+                  }}
+                  playIntro={introActive}
+                  onIntroComplete={() => setIntroActive(false)}
+                  stats={{ ...dashboardStats, pendingApprovals: pendingApprovalCount }}
+                  recentActivity={recentActivity}
+                  privacySnapshot={privacySnapshot}
+                  workflowSnapshot={workflowSnapshot}
+                  metricHistory={metricHistory}
+                />
               )}
             </motion.div>
           </AnimatePresence>

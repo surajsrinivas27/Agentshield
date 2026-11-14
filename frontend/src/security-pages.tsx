@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useState, type CSSProperties, type ReactNode } from 'react'
 import {
   Activity,
   ArrowRight,
@@ -18,7 +18,49 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { submitApproval, type WorkflowResponse } from './api'
+import { submitApproval, type PrivacyEntity, type WorkflowResponse } from './api'
+
+export type PrivacyComparison = {
+  originalText: string
+  maskedText: string
+  entities: PrivacyEntity[]
+}
+
+function TaintTrace({
+  sourceId,
+  sourceType,
+  comparison,
+}: {
+  sourceId: string
+  sourceType: 'email' | 'document'
+  comparison: PrivacyComparison | null
+}) {
+  return (
+    <details className="taint-trace">
+      <summary>Inspect source taint trail</summary>
+      <div className="taint-trace-content">
+        <div className="taint-chain">
+          <span>{sourceType === 'email' ? 'External email' : 'External document'}</span>
+          <b>→</b>
+          <span>Agent proposal</span>
+          <b>→</b>
+          <span>Policy decision</span>
+        </div>
+        {comparison ? (
+          <>
+            <p>Untrusted source <strong>{sourceId}</strong> was provided to this workflow. The excerpt below is locally masked:</p>
+            <pre>{comparison.maskedText.slice(0, 900)}{comparison.maskedText.length > 900 ? '…' : ''}</pre>
+          </>
+        ) : (
+          <p>Source {sourceId} was provided to this workflow and is treated as untrusted input.</p>
+        )}
+        <small>
+          The current API response does not include action arguments or source-span provenance, so it cannot identify the exact sentence that triggered this proposal.
+        </small>
+      </div>
+    </details>
+  )
+}
 
 export type PrivacySnapshot = {
   total: number
@@ -80,11 +122,15 @@ function EmptyState({
 
 export function PrivacyGuardPage({
   snapshot,
+  comparison,
   onNewRequest,
 }: {
   snapshot: PrivacySnapshot | null
+  comparison: PrivacyComparison | null
   onNewRequest: () => void
 }) {
+  const [comparisonPosition, setComparisonPosition] = useState(50)
+
   return (
     <section className="feature-screen">
       <PageHeading
@@ -168,6 +214,45 @@ export function PrivacyGuardPage({
               </CardContent>
             </Card>
           </motion.div>
+
+          {comparison && (
+            <motion.div className="feature-wide" variants={featureItem}>
+              <Card className="feature-card comparison-card">
+                <CardHeader>
+                  <CardTitle>Before and after masking</CardTitle>
+                  <CardDescription>
+                    Drag the divider to compare the original input with the locally masked text sent to the workflow.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div
+                    className="privacy-comparison"
+                    style={{ '--compare-split': `${comparisonPosition}%` } as CSSProperties}
+                  >
+                    <pre className="compare-original">{comparison.originalText}</pre>
+                    <pre className="compare-masked">{comparison.maskedText}</pre>
+                    <div className="compare-labels" aria-hidden="true">
+                      <span>ORIGINAL</span><span>MASKED FOR AI</span>
+                    </div>
+                    <div className="compare-divider" aria-hidden="true" />
+                    <input
+                      className="compare-slider"
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={comparisonPosition}
+                      onChange={(event) => setComparisonPosition(Number(event.target.value))}
+                      aria-label="Compare original text and masked text"
+                      aria-valuetext={`${comparisonPosition}% masked text visible`}
+                    />
+                  </div>
+                  <p className="comparison-memory-note">
+                    The original text stays in this browser tab’s memory and is not sent to the AI workflow.
+                  </p>
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
         </motion.div>
       )}
     </section>
@@ -185,9 +270,11 @@ const featureItem = {
 
 export function AgentActivityPage({
   snapshot,
+  comparison,
   onNewRequest,
 }: {
   snapshot: WorkflowSnapshot | null
+  comparison: PrivacyComparison | null
   onNewRequest: () => void
 }) {
   return (
@@ -245,6 +332,11 @@ export function AgentActivityPage({
                     </div>
                     <p>{action.reason}</p>
                     <small>Source {snapshot.sourceId} · {snapshot.sourceType}</small>
+                    <TaintTrace
+                      sourceId={snapshot.sourceId}
+                      sourceType={snapshot.sourceType}
+                      comparison={comparison}
+                    />
                   </div>
                 </motion.article>
               ))}
@@ -256,6 +348,93 @@ export function AgentActivityPage({
         </>
       )}
     </section>
+  )
+}
+
+function PolicySimulator({ actions }: { actions: WorkflowResponse['actions'] }) {
+  const [rules, setRules] = useState({
+    roleAllowed: true,
+    blockUntrusted: true,
+    requireApproval: true,
+  })
+  const blockedActions = actions.filter((action) => action.decision === 'BLOCK')
+  const [selectedActionId, setSelectedActionId] = useState('')
+  const testAction = blockedActions.find((action) => action.action_id === selectedActionId) ?? blockedActions[0] ?? null
+  const simulatedDecision = !testAction
+    ? null
+    : !rules.roleAllowed || rules.blockUntrusted
+      ? 'BLOCK'
+      : rules.requireApproval
+        ? 'APPROVE'
+        : 'ALLOW'
+  const toggleRule = (key: keyof typeof rules) => {
+    setRules((current) => ({ ...current, [key]: !current[key] }))
+  }
+
+  const controls: { key: keyof typeof rules; label: string; description: string }[] = [
+    { key: 'roleAllowed', label: 'RBAC · Role is permitted', description: 'Block actions when the current role lacks permission.' },
+    { key: 'blockUntrusted', label: 'ABAC · Block untrusted instructions', description: 'Treat instructions from email and document content as untrusted.' },
+    { key: 'requireApproval', label: 'Require human approval', description: 'Route otherwise allowed actions to a reviewer.' },
+  ]
+
+  return (
+    <Card className="feature-card policy-simulator">
+      <CardHeader>
+        <div className="simulator-heading-row">
+          <div>
+            <CardTitle>Policy playground</CardTitle>
+            <CardDescription>Toggle local rules and see a what-if result for a previous BLOCK.</CardDescription>
+          </div>
+          <span className="simulator-badge">LOCAL SIMULATION</span>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="policy-playground-grid">
+          <div className="policy-controls">
+            {controls.map((control) => (
+              <label className="policy-toggle" key={control.key}>
+                <span className="policy-toggle-copy">
+                  <strong>{control.label}</strong>
+                  <small>{control.description}</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={rules[control.key]}
+                  onChange={() => toggleRule(control.key)}
+                  aria-label={control.label}
+                />
+              </label>
+            ))}
+          </div>
+          <div className="policy-simulation-result" aria-live="polite">
+            {testAction ? (
+              <>
+                <span className="simulation-label">WHAT-IF OUTCOME</span>
+                <strong className={`audit-decision ${simulatedDecision?.toLowerCase()}`}>{simulatedDecision}</strong>
+                <p><b>{testAction.action_id}</b> · actual backend decision: <strong>BLOCK</strong></p>
+                <small>{testAction.reason}</small>
+                {blockedActions.length > 1 && (
+                  <label className="simulation-select-label">
+                    Test blocked action
+                    <select
+                      value={testAction.action_id}
+                      onChange={(event) => setSelectedActionId(event.target.value)}
+                    >
+                      {blockedActions.map((action) => <option value={action.action_id} key={action.action_id}>{action.action_id}</option>)}
+                    </select>
+                  </label>
+                )}
+              </>
+            ) : (
+              <p>Run a workflow that returns a <strong>BLOCK</strong> decision to enable a real test case.</p>
+            )}
+          </div>
+        </div>
+        <p className="simulator-disclaimer">
+          This browser-only simulation does not change backend policies, submit approvals, or execute actions. The backend remains authoritative.
+        </p>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -307,6 +486,8 @@ export function AuthorizationPage({
         title="Authorization Center"
         description="Review actions marked for human approval. ALLOW and BLOCK decisions are determined by the backend policy gateway."
       />
+
+      <PolicySimulator actions={actions} />
 
       {!actions.length ? (
         <EmptyState
