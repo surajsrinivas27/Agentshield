@@ -13,12 +13,14 @@ Provides:
 
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Set
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+import sqlalchemy.types as types
 
 # Load environment variables if present
 load_dotenv()
@@ -117,6 +119,42 @@ SessionLocal = sessionmaker(
 
 # Declarative base for all SQLAlchemy ORM models
 Base = declarative_base()
+
+
+class UTCDateTime(types.TypeDecorator):
+    """
+    SQLAlchemy TypeDecorator that enforces timezone-aware UTC datetimes.
+
+    Invariants:
+    - Rejects naive datetime inputs on bind (raises ValueError).
+    - Rejects non-datetime inputs on bind (raises TypeError).
+    - Normalizes timezone-aware datetimes to UTC before storing.
+    - Restores timezone.utc on retrieved datetimes, countering SQLite's
+      default behavior of returning offset-naive datetimes.
+    """
+    impl = types.DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[Any], dialect: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
+            raise TypeError(f"UTCDateTime expected a datetime object, got {type(value).__name__}")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "UTCDateTime requires a timezone-aware datetime object with a valid UTC offset; "
+                "got an offset-naive datetime."
+            )
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(self, value: Optional[Any], dialect: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 def get_db() -> Generator[Session, None, None]:
